@@ -10,6 +10,7 @@ build*
 opensbi-build*
 initramfs*
 spike-build*
+dist
 
 *.tmp
 *.log
@@ -29,6 +30,8 @@ spike-build*
 
 *.swp
 *.swo
+
+*.tar.gz
 
 .DS_Store
 Thumbs.db
