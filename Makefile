@@ -57,6 +57,12 @@ SPIKE_MEM    ?= 512
 # Prefix command with timeout if QEMU_TIMEOUT is set
 IF_TIMEOUT = $(if $(QEMU_TIMEOUT),timeout $(QEMU_TIMEOUT),)
 
+# Release package name and output tarball path
+RELEASE_NAME    := linux-riscv-rv$(BITS)-v$(KERNEL_VERSION)
+RELEASE_TARBALL := $(PWD_DIR)/dist/$(RELEASE_NAME).tar.gz
+# Staging directory under dist/ (cleaned after tarball is created)
+RELEASE_STAGING := $(PWD_DIR)/dist/$(RELEASE_NAME)
+
 # All kernel make invocations use a separate output dir via O=
 KERNEL_MAKE := make -C linux O=$(OBJDIR) ARCH=riscv CROSS_COMPILE=$(CROSS_COMPILE) -j$(NPROC)
 # scripts/config wrapper that operates on the per-bitness .config
@@ -101,10 +107,18 @@ all:
 	@echo "  build_all                    - Build Linux + OpenSBI for both 32 and 64 bit"
 	@echo "  clean                        - Remove all build artefacts"
 	@echo ""
+	@echo "--- Package & Release ---"
+	@echo "  package                      - Bundle rv$(BITS) artifacts → $(RELEASE_TARBALL)"
+	@echo "  package_all                  - Bundle rv32 + rv64 tarballs"
+	@echo "  github_release               - Create GitHub Release and upload tarballs (requires gh CLI)"
+	@echo "  clean_packages               - Remove release tarballs from workspace"
+	@echo ""
 	@echo "Examples:"
 	@echo "  make BITS=32 build_linux make_initramfs_simple install_initramfs build_opensbi_with_kernel"
 	@echo "  make BITS=64 build_linux make_initramfs_buildroot install_initramfs build_opensbi_with_kernel"
 	@echo "  make BITS=32 test_qemu"
+	@echo "  make package_all"
+	@echo "  make github_release TAG=v$(KERNEL_VERSION)"
 
 # ---------------------------------------------------------------------------
 # Source acquisition
@@ -290,6 +304,132 @@ build_all: linux opensbi
 	$(MAKE) BITS=32 build_linux make_initramfs_simple install_initramfs build_opensbi_with_kernel
 	$(MAKE) BITS=64 build_linux make_initramfs_simple install_initramfs build_opensbi_with_kernel
 
+# ---------------------------------------------------------------------------
+# Package: bundle build artifacts into a distributable tarball
+#
+# Usage:
+#   make BITS=32 package   → linux-riscv-rv32-v<ver>.tar.gz
+#   make BITS=64 package   → linux-riscv-rv64-v<ver>.tar.gz
+#   make package_all       → both tarballs
+# ---------------------------------------------------------------------------
+
+package:
+	@echo "--- Checking artifacts for rv$(BITS) ---"
+	@test -f $(OPENSBI_OBJDIR)/platform/generic/firmware/fw_payload.bin || \
+		(echo "ERROR: fw_payload.bin not found. Run build_opensbi_with_kernel first." && false)
+	@test -f $(OPENSBI_OBJDIR)/platform/generic/firmware/fw_payload.elf || \
+		(echo "ERROR: fw_payload.elf not found. Run build_opensbi_with_kernel first." && false)
+	@test -f $(OPENSBI_OBJDIR)/platform/generic/firmware/fw_dynamic.bin || \
+		(echo "ERROR: fw_dynamic.bin not found. Run build_opensbi first." && false)
+	@test -f $(OBJDIR)/arch/riscv/boot/Image || \
+		(echo "ERROR: Image not found. Run build_linux first." && false)
+	@test -f $(INITRAMFS_CPIO) || \
+		(echo "ERROR: $(INITRAMFS_CPIO) not found. Run make_initramfs_simple or make_initramfs_buildroot first." && false)
+	@echo "--- Assembling $(RELEASE_NAME) ---"
+	rm -rf $(RELEASE_STAGING)
+	mkdir -p $(PWD_DIR)/dist
+	mkdir -p $(RELEASE_STAGING)
+	cp $(OPENSBI_OBJDIR)/platform/generic/firmware/fw_payload.bin $(RELEASE_STAGING)/
+	cp $(OPENSBI_OBJDIR)/platform/generic/firmware/fw_payload.elf $(RELEASE_STAGING)/
+	cp $(OPENSBI_OBJDIR)/platform/generic/firmware/fw_dynamic.bin $(RELEASE_STAGING)/
+	cp $(OBJDIR)/arch/riscv/boot/Image                            $(RELEASE_STAGING)/
+	cp $(INITRAMFS_CPIO)                                          $(RELEASE_STAGING)/initramfs.cpio.gz
+	cp $(OBJDIR)/vmlinux                                          $(RELEASE_STAGING)/
+	@echo "--- Generating README.md ---"
+	@( \
+	  echo "# Linux $(KERNEL_VERSION) for RISC-V rv$(BITS)imac (no FPU)"; \
+	  echo ""; \
+	  echo "| Field | Value |"; \
+	  echo "|-------|-------|"; \
+	  echo "| ISA   | \`$(RISCV_ISA)\` |"; \
+	  echo "| ABI   | \`$(RISCV_ABI)\` |"; \
+	  echo "| Build | $$(date +%Y-%m-%d) |"; \
+	  echo ""; \
+	  echo "## Files"; \
+	  echo ""; \
+	  echo "| File | Description |"; \
+	  echo "|------|-------------|"; \
+	  echo "| \`fw_payload.bin\` | OpenSBI firmware with Linux kernel embedded — QEMU one-shot boot |"; \
+	  echo "| \`fw_payload.elf\` | OpenSBI + kernel ELF for Spike simulator |"; \
+	  echo "| \`fw_dynamic.bin\` | OpenSBI dynamic firmware (use alongside a separate kernel \`Image\`) |"; \
+	  echo "| \`Image\` | Linux kernel image (rv$(BITS)imac, no FPU) |"; \
+	  echo "| \`initramfs.cpio.gz\` | Minimal root filesystem (cpio + gzip) |"; \
+	  echo "| \`vmlinux\` | Unstripped kernel ELF with debug symbols — for use with GDB / JTAG |"; \
+	  echo ""; \
+	  echo "## Quickstart"; \
+	  echo ""; \
+	  echo "### 1. QEMU — single-file boot with \`fw_payload.bin\` (simplest)"; \
+	  echo ""; \
+	  echo '```bash'; \
+	  echo "qemu-system-riscv$(BITS) -M virt -m 512M -nographic \\"; \
+	  echo "    -bios fw_payload.bin"; \
+	  echo '```'; \
+	  echo ""; \
+	  echo "### 2. QEMU — separate kernel + initramfs (\`fw_dynamic\` + \`Image\`)"; \
+	  echo ""; \
+	  echo '```bash'; \
+	  echo "qemu-system-riscv$(BITS) -M virt -m 512M -nographic \\"; \
+	  echo "    -bios fw_dynamic.bin \\"; \
+	  echo "    -kernel Image \\"; \
+	  echo "    -initrd initramfs.cpio.gz \\"; \
+	  echo "    -append \"root=/dev/ram rdinit=/init console=ttyS0 earlycon=sbi\""; \
+	  echo '```'; \
+	  echo ""; \
+	  echo "### 3. Spike — ISA simulator"; \
+	  echo ""; \
+	  echo '```bash'; \
+	  echo "spike --isa=$(RISCV_ISA) -m512 fw_payload.elf"; \
+	  echo '```'; \
+	  echo ""; \
+	  echo "## Notes"; \
+	  echo ""; \
+	  echo "- FPU is disabled; your toolchain should target \`rv$(BITS)imac\` / \`$(RISCV_ABI)\`."; \
+	  echo "- Press **Ctrl-A X** to quit QEMU."; \
+	  echo "- Spike requires riscv-isa-sim with rv$(BITS) support."; \
+	  echo "  Build guide: <https://github.com/riscv-software-src/riscv-isa-sim>"; \
+	) > $(RELEASE_STAGING)/README.md
+	tar -czf $(RELEASE_TARBALL) -C $(PWD_DIR)/dist $(RELEASE_NAME)
+	@echo "Package ready: $(RELEASE_TARBALL)"
+
+package_all:
+	$(MAKE) BITS=32 package
+	$(MAKE) BITS=64 package
+	@echo ""
+	@echo "Packages ready:"
+	@echo "  $(PWD_DIR)/dist/linux-riscv-rv32-v$(KERNEL_VERSION).tar.gz"
+	@echo "  $(PWD_DIR)/dist/linux-riscv-rv64-v$(KERNEL_VERSION).tar.gz"
+
+# ---------------------------------------------------------------------------
+# GitHub Release  (requires the 'gh' CLI: https://cli.github.com)
+#
+# Usage:
+#   make github_release                    # tag = v<KERNEL_VERSION>
+#   make github_release TAG=v6.18.15-rc1  # custom tag
+#
+# Both rv32 and rv64 tarballs must exist (run 'make package_all' first).
+# ---------------------------------------------------------------------------
+
+TAG ?= v$(KERNEL_VERSION)
+
+github_release:
+	@command -v gh >/dev/null 2>&1 || \
+		(echo "ERROR: 'gh' CLI not found. Install from https://cli.github.com" && false)
+	@test -f $(PWD_DIR)/dist/linux-riscv-rv32-v$(KERNEL_VERSION).tar.gz || \
+		(echo "ERROR: rv32 tarball not found. Run 'make package_all' first." && false)
+	@test -f $(PWD_DIR)/dist/linux-riscv-rv64-v$(KERNEL_VERSION).tar.gz || \
+		(echo "ERROR: rv64 tarball not found. Run 'make package_all' first." && false)
+	@echo "--- Creating GitHub Release $(TAG) ---"
+	gh release create $(TAG) \
+		$(PWD_DIR)/dist/linux-riscv-rv32-v$(KERNEL_VERSION).tar.gz \
+		$(PWD_DIR)/dist/linux-riscv-rv64-v$(KERNEL_VERSION).tar.gz \
+		--title "Linux $(KERNEL_VERSION) for RISC-V rv32/rv64imac" \
+		--notes "Pre-built Linux $(KERNEL_VERSION) kernels for RISC-V rv32imac and rv64imac (no FPU).\n\nSee README.md inside each tarball for boot instructions (QEMU / Spike)."
+	@echo "Release $(TAG) published."
+
+clean_packages:
+	rm -rf $(PWD_DIR)/dist
+	@echo "dist/ removed."
+
 clean:
 	rm -rf linux build32 build64 \
 		initramfs32 initramfs64 initramfs32.cpio.gz initramfs64.cpio.gz \
@@ -308,5 +448,6 @@ clean_buildroot:
         build_init make_initramfs_simple make_initramfs_buildroot install_initramfs \
         build_opensbi build_opensbi_with_kernel build_spike \
         test_qemu test_qemu_kernel test_spike \
-        build_all clean clean_buildroot clean_spike
+        build_all clean clean_buildroot clean_spike \
+        package package_all github_release clean_packages
 
