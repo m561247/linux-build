@@ -1,0 +1,159 @@
+# scripts/buildroot.mk — Buildroot-related targets and variables
+#
+# Included by the top-level Makefile.  All variables defined there
+# (PWD_DIR, BITS, KERNEL_VERSION, CROSS_COMPILE, OBJDIR, KCONFIG,
+#  KERNEL_MAKE, KERNEL_IMAGE, FW_*, QEMU_BASE, IF_TIMEOUT, NPROC, …)
+# are available here.
+# ---------------------------------------------------------------------------
+
+# Per-bitness Buildroot initramfs CPIO
+BUILDROOT_CPIO := $(PWD_DIR)/initramfs$(BITS)-buildroot.cpio.gz
+
+# Buildroot per-bitness clone directory
+BUILDROOT_DIR  := $(PWD_DIR)/buildroot$(BITS)
+# Buildroot config fragment applied on top of qemu_riscv*_virt_defconfig
+BUILDROOT_CFG  := $(PWD_DIR)/configs/buildroot.cfg
+
+# Buildroot release package (distinct from simple initramfs package)
+BUILDROOT_RELEASE_NAME    := linux-riscv-rv$(BITS)-buildroot-v$(KERNEL_VERSION)
+BUILDROOT_RELEASE_TARBALL := $(PWD_DIR)/dist/$(BUILDROOT_RELEASE_NAME).tar.gz
+BUILDROOT_RELEASE_STAGING := $(PWD_DIR)/dist/$(BUILDROOT_RELEASE_NAME)
+
+# QEMU kernel boot arguments for Buildroot (uses BUILDROOT_CPIO)
+QEMU_KERNEL_BUILDROOT_ARGS = \
+	-bios $(FW_DYNAMIC_BIN) \
+	-kernel $(KERNEL_IMAGE) \
+	-initrd $(BUILDROOT_CPIO) \
+	-append "root=/dev/ram rdinit=/init console=ttyS0 earlycon=sbi"
+
+# Networking for buildroot variants: virtio-net with user-mode NAT + SSH forwarding
+SSH_PORT ?= 2222
+QEMU_NET := -netdev user,id=net0,hostfwd=tcp::$(SSH_PORT)-:22 \
+            -device virtio-net-device,netdev=net0
+
+# Optional 9P host directory share (set SHARE_DIR=/path to enable)
+# Set SHARE_RO=1 to mount read-only (prevents guest from writing to host)
+comma := ,
+QEMU_SHARE_RW = $(if $(SHARE_DIR),-fsdev local$(comma)id=fsdev0$(comma)path=$(SHARE_DIR)$(comma)security_model=mapped \
+                -device virtio-9p-device$(comma)fsdev=fsdev0$(comma)mount_tag=hostshare)
+QEMU_SHARE_RO = $(if $(SHARE_DIR),-fsdev local$(comma)id=fsdev0$(comma)path=$(SHARE_DIR)$(comma)security_model=mapped$(comma)readonly=on \
+                -device virtio-9p-device$(comma)fsdev=fsdev0$(comma)mount_tag=hostshare)
+QEMU_SHARE = $(if $(SHARE_RO),$(QEMU_SHARE_RO),$(QEMU_SHARE_RW))
+
+# ---------------------------------------------------------------------------
+# Source acquisition
+# ---------------------------------------------------------------------------
+
+buildroot:
+	@if [ -d $(BUILDROOT_DIR) ]; then \
+		echo "$(BUILDROOT_DIR) already exists, skipping clone"; \
+	else \
+		git clone --depth=1 https://github.com/buildroot/buildroot $(BUILDROOT_DIR); \
+	fi
+
+# ---------------------------------------------------------------------------
+# Buildroot initramfs
+# ---------------------------------------------------------------------------
+
+# Incremental Buildroot build: regenerates .config from defconfig + fragment
+# but keeps build artefacts for fast incremental rebuilds.
+# Use make_initramfs_buildroot_clean for a full from-scratch rebuild.
+make_initramfs_buildroot: buildroot
+	# (Re)generate .config from defconfig + our config fragment.
+	# First strip symbols that our fragment overrides so its values win,
+	# even for Kconfig "choice" groups (e.g. BR2_SYSTEM_BIN_SH_BASH).
+	make -C $(BUILDROOT_DIR) qemu_riscv$(BITS)_virt_defconfig
+	@grep -oE '^(# )?BR2_[A-Za-z0-9_]+' $(BUILDROOT_CFG) | \
+	  sed 's/^# //' | sort -u | \
+	  while read sym; do \
+	    sed -i "/^$${sym}[= ]/d; /^# $${sym} is not set/d" $(BUILDROOT_DIR)/.config; \
+	  done
+	cat $(BUILDROOT_CFG) >> $(BUILDROOT_DIR)/.config
+	make -C $(BUILDROOT_DIR) olddefconfig
+	make -C $(BUILDROOT_DIR) -j$(NPROC)
+	cp $(BUILDROOT_DIR)/output/images/rootfs.cpio.gz $(BUILDROOT_CPIO)
+	# Buildroot default configs use ilp32d/lp64d ABI (hardware FPU), so enable
+	# CONFIG_FPU in the kernel to support those userspace binaries.
+	$(KCONFIG) --enable CONFIG_FPU
+	@echo "Buildroot initramfs: $(BUILDROOT_CPIO)"
+
+# Full clean Buildroot rebuild (slow — use only when incremental gives stale results)
+make_initramfs_buildroot_clean: buildroot
+	make -C $(BUILDROOT_DIR) distclean
+	$(MAKE) make_initramfs_buildroot
+
+# Convenience: rebuild Buildroot only (fastest iteration for package changes)
+# Boot with: make BITS=$(BITS) test_qemu_kernel_buildroot
+update_buildroot:
+	$(MAKE) make_initramfs_buildroot
+	@echo ""
+	@echo "Done. Test with:  make BITS=$(BITS) test_qemu_kernel_buildroot"
+
+# Like update_buildroot but also re-embeds initramfs into kernel + rebuilds OpenSBI
+# (needed only when booting via fw_payload / test_qemu_buildroot).
+update_buildroot_full:
+	$(MAKE) make_initramfs_buildroot install_initramfs_buildroot build_opensbi_with_kernel
+
+# ---------------------------------------------------------------------------
+# Embed Buildroot initramfs into kernel Image
+# ---------------------------------------------------------------------------
+
+install_initramfs_buildroot:
+	$(call require,$(BUILDROOT_CPIO),Run make_initramfs_buildroot first.)
+	$(KCONFIG) --set-str CONFIG_INITRAMFS_SOURCE $(BUILDROOT_CPIO)
+	$(KERNEL_MAKE) olddefconfig
+	$(KERNEL_MAKE)
+	@echo "Kernel with embedded Buildroot initramfs: $(KERNEL_IMAGE)"
+
+# ---------------------------------------------------------------------------
+# QEMU Buildroot tests
+# ---------------------------------------------------------------------------
+
+# Buildroot variants: add virtio-net (eth0 + SSH) and optional 9P host share.
+# SSH from host:  ssh root@localhost -p $(SSH_PORT)
+# Host 9P share:  make SHARE_DIR=/path test_qemu_buildroot
+test_qemu_buildroot:
+	$(call require,$(FW_PAYLOAD_BIN),Run build_opensbi_with_kernel first.)
+	$(IF_TIMEOUT) $(QEMU_BASE) $(QEMU_NET) $(QEMU_SHARE) -bios $(FW_PAYLOAD_BIN)
+
+test_qemu_kernel_buildroot:
+	$(call require,$(KERNEL_IMAGE),Run build_linux first.)
+	$(call require,$(BUILDROOT_CPIO),Run make_initramfs_buildroot first.)
+	$(IF_TIMEOUT) $(QEMU_BASE) $(QEMU_NET) $(QEMU_SHARE) $(QEMU_KERNEL_BUILDROOT_ARGS)
+
+# ---------------------------------------------------------------------------
+# Package Buildroot artifacts
+# ---------------------------------------------------------------------------
+
+package_buildroot:
+	@echo "--- Checking Buildroot artifacts for rv$(BITS) ---"
+	$(call require,$(FW_PAYLOAD_BIN),Run build_opensbi_with_kernel first.)
+	$(call require,$(FW_PAYLOAD_ELF),Run build_opensbi_with_kernel first.)
+	$(call require,$(FW_DYNAMIC_BIN),Run build_opensbi first.)
+	$(call require,$(KERNEL_IMAGE),Run build_linux first.)
+	$(call require,$(BUILDROOT_CPIO),Run make_initramfs_buildroot first.)
+	@echo "--- Assembling $(BUILDROOT_RELEASE_NAME) ---"
+	rm -rf $(BUILDROOT_RELEASE_STAGING)
+	mkdir -p $(BUILDROOT_RELEASE_STAGING)
+	cp $(FW_PAYLOAD_BIN) $(FW_PAYLOAD_ELF) $(FW_DYNAMIC_BIN) $(BUILDROOT_RELEASE_STAGING)/
+	cp $(KERNEL_IMAGE) $(BUILDROOT_RELEASE_STAGING)/
+	cp $(BUILDROOT_CPIO) $(BUILDROOT_RELEASE_STAGING)/initramfs.cpio.gz
+	cp $(OBJDIR)/vmlinux $(BUILDROOT_RELEASE_STAGING)/
+	bash scripts/gen-package-readme.sh $(BITS) $(KERNEL_VERSION) $(RISCV_ISA) $(RISCV_ABI) buildroot \
+		> $(BUILDROOT_RELEASE_STAGING)/README.md
+	tar -czf $(BUILDROOT_RELEASE_TARBALL) -C $(PWD_DIR)/dist $(BUILDROOT_RELEASE_NAME)
+	@echo "Package ready: $(BUILDROOT_RELEASE_TARBALL)"
+
+# ---------------------------------------------------------------------------
+# Housekeeping
+# ---------------------------------------------------------------------------
+
+clean_buildroot:
+	rm -rf buildroot32 buildroot64
+
+.PHONY: buildroot \
+        make_initramfs_buildroot make_initramfs_buildroot_clean \
+        install_initramfs_buildroot \
+        update_buildroot update_buildroot_full \
+        test_qemu_buildroot test_qemu_kernel_buildroot \
+        package_buildroot clean_buildroot

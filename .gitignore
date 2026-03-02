@@ -6,11 +6,15 @@ opensbi
 spike
 
 init
-build*
+build32
+build64
+buildroot32*
+buildroot64*
 opensbi-build*
 initramfs*
 spike-build*
 dist
+share
 
 *.tmp
 *.log
